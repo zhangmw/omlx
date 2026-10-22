@@ -9,8 +9,32 @@ from PIL import Image
 
 from omlx.cache.paged_cache import PagedCacheManager
 from omlx.cache.prefix_cache import BlockAwarePrefixCache
-from omlx.engine.vlm import VLMBatchedEngine, _audio_feature_cache_key_ranges
+from omlx.engine.vlm import (
+    VLMBatchedEngine,
+    _audio_feature_cache_key_ranges,
+    _decision_cache_suffix,
+)
 from omlx.utils.image import compute_image_hash
+
+
+def test_decision_tail_marks_varying_question_after_shared_image_input():
+    tokenizer = SimpleNamespace(
+        encode=lambda text, **kwargs: list(text.encode()),
+        decode=lambda ids: bytes(ids).decode(),
+    )
+    text = "state mentions Question: A before image\n<image>\nQuestion: A\nAnswer:"
+    suffix = _decision_cache_suffix(tokenizer, list(text.encode()), "Question: A")
+    assert suffix == "Question: A\nAnswer:"
+    assert text[: -len(suffix)] == "state mentions Question: A before image\n<image>\n"
+    assert _decision_cache_suffix(tokenizer, list(text.encode()), "Question: B") is None
+
+
+def test_decision_tail_rejects_non_roundtripping_token_suffix():
+    tokenizer = SimpleNamespace(
+        encode=lambda text, **kwargs: list(text.encode()),
+        decode=lambda ids: "changed",
+    )
+    assert _decision_cache_suffix(tokenizer, list(b"input Question: A"), "Question: A") is None
 
 
 def prepare_case(full, prefixes, *, grid=None, counts=(1, 1), model_type="qwen3_5"):

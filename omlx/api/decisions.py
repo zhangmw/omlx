@@ -198,14 +198,16 @@ async def _readout(
     option in a group, and the readout over the winners still applies it.
     """
     capture = OptionLogitsCapture(letter_ids[: len(options)])
+    question_text = render_question(instructions, options)
     output = await chat(
-        build_messages(parts, render_question(instructions, options), multimodal),
+        build_messages(parts, question_text, multimodal),
         max_tokens=1,
         temperature=0.0,
         top_p=1.0,
         chat_template_kwargs=dict(READOUT_TEMPLATE_KWARGS),
         is_partial=True,
         logits_observer=capture,
+        decision_question=question_text,
     )
     if capture.logprobs is None:
         raise DecisionsRequestError(

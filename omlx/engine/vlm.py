@@ -121,6 +121,7 @@ VLM_LANGUAGE_PROMPT_KWARGS = ("mm_token_type_ids", "token_type_ids")
 
 COHERE2_MOE_MODEL_TYPE = "cohere2_moe"
 QWEN4_EXP_MODEL_TYPE = "qwen4_exp"
+
 MINIMAX_M3_VL_MODEL_TYPE = "minimax_m3_vl"
 MINIMAX_M3_MODEL_TYPES = {"minimax_m3", MINIMAX_M3_VL_MODEL_TYPE}
 # mlx-vlm's Gemma4Processor.apply_chat_template renders the messages again. It
@@ -155,6 +156,23 @@ OCR_MODEL_GENERATION_DEFAULTS: Dict[str, Dict[str, Any]] = {
     },
 }
 
+
+def _decision_cache_suffix(tokenizer, prompt, question: str) -> str | None:
+    """Locate a token-exact question suffix for the existing tail snapshot path."""
+    if not question or not isinstance(prompt, list):
+        return None
+    needle = tokenizer.encode(question, add_special_tokens=False)
+    if not needle:
+        return None
+    for start in range(len(prompt) - len(needle), 0, -1):
+        if prompt[start : start + len(needle)] != needle:
+            continue
+        suffix_ids = prompt[start:]
+        suffix = tokenizer.decode(suffix_ids)
+        if tokenizer.encode(suffix, add_special_tokens=False) == suffix_ids:
+            return suffix
+        return None
+    return None
 
 def _read_config_model_type(model_path: str | Path) -> str | None:
     config_path = Path(model_path) / "config.json"
@@ -5124,6 +5142,7 @@ class VLMBatchedEngine(BaseEngine):
         # _process_chat_messages pops these; the tail marker needs them too.
         ct_kwargs = kwargs.get("chat_template_kwargs")
         partial = kwargs.get("is_partial")
+        decision_question = kwargs.pop("decision_question", None)
         (
             prompt,
             vlm_embeds,
@@ -5142,6 +5161,13 @@ class VLMBatchedEngine(BaseEngine):
         # SpecPrefill: protect the system-prompt region, mirroring stream_chat.
         self._inject_specprefill_system_end(messages, prompt, kwargs)
         generation_prompt, persists = self._generation_prompt_text(ct_kwargs, partial)
+        if decision_question and self._vlm_model.config.model_type == QWEN4_EXP_MODEL_TYPE:
+            # Snapshot the shared input before its varying question, even when
+            # it is shorter than Qwen4's 8192-token cache block. Ordinary chat
+            # and long-input prefill keep their existing geometry.
+            suffix = _decision_cache_suffix(self.tokenizer, prompt, decision_question)
+            if suffix:
+                generation_prompt, persists = suffix, False
         if generation_prompt:
             kwargs["generation_prompt_text"] = generation_prompt
             kwargs["generation_prompt_persists"] = persists
