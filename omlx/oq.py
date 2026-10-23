@@ -19,6 +19,7 @@ import os
 import re
 import shutil
 import struct as _struct
+import sys
 import tempfile
 import time as _time
 from dataclasses import dataclass
@@ -32,10 +33,23 @@ try:
     import mlx.nn as nn
     from mlx.utils import tree_flatten, tree_unflatten
     from mlx_lm.models.base import create_attention_mask
+    from mlx_lm.utils import _get_classes
+
+    from omlx.patches import minimax_m3_dspark as minimax_dspark
+    from omlx.patches.mlx_vlm_minimax_m3_compat import virtual_nvfp4 as minimax_nvfp4
 
     HAS_MLX = True
 except ImportError:
     HAS_MLX = False
+
+try:
+    from mlx_lm.tokenizer_utils import load as load_mlx_lm_tokenizer
+    from mlx_lm.utils import load_model
+
+    from omlx.patches.muse_spark import model as muse_spark_serving
+    from omlx.patches.muse_spark import oq_layout as muse_spark_layout
+except ImportError:
+    muse_spark_layout = muse_spark_serving = None
 
 from omlx.model_discovery import (
     D3_DECISION_CONFIG,
@@ -57,6 +71,7 @@ _OQ_DEFAULT_GROUP_SIZE = 64
 
 _GLM_INDEXER_Q8 = {"bits": 8, "group_size": 64, "mode": "affine"}
 _GLM_INDEXER_PROJECTIONS = ("wq_b", "wk", "weights_proj")
+_MINIMAX_INDEXER_PROJECTIONS = ("index_q_proj", "index_k_proj")
 
 _QWEN4_EXP_NGRAM_GROUP_SIZE = 32
 _QWEN4_EXP_NGRAM_SHARD_RE = re.compile(
@@ -76,14 +91,13 @@ def _is_qwen4_exp_config(config: dict) -> bool:
     )
 
 
+def _is_muse_spark(config: dict) -> bool:
+    return str(config.get("model_type", "")).lower() == "muse_spark"
+
+
 def _is_muse_spark_modelopt_nvfp4(config: dict) -> bool:
     """Return whether *config* is a Muse Spark ModelOpt NVFP4 export."""
-    quant = config.get("quantization_config") or {}
-    return (
-        str(config.get("model_type", "")).lower() == "muse_spark"
-        and quant.get("quant_method") == "modelopt"
-        and quant.get("quant_algo") == "NVFP4"
-    )
+    return _is_muse_spark(config) and muse_spark_layout.is_modelopt_nvfp4(config)
 
 
 def _muse_spark_passthrough_capture_skip(
@@ -96,21 +110,20 @@ def _muse_spark_passthrough_capture_skip(
     """
     if not _is_muse_spark_modelopt_nvfp4(config):
         return frozenset()
-    from omlx.patches.muse_spark.muse_spark_model import (
-        ModelArgs,
-        modelopt_nvfp4_expert_layers,
-    )
-
     floor_config = {**config, "_oq_boost_map": {}}
     names = set()
-    for i in modelopt_nvfp4_expert_layers(ModelArgs.from_dict(config)):
+    for i in muse_spark_layout.modelopt_nvfp4_expert_layers(config):
         for proj in ("gate_proj", "up_proj", "down_proj"):
             name = f"language_model.model.layers.{i}.mlp.switch_mlp.{proj}"
             bits, _, _ = _get_predicate_bits(
                 f"{name}.weight", floor_config, oq_level, group_size
             )
             if bits is not None and bits >= 4:
+                # Calibration names the experts as mlx-lm's model does,
+                # per layer (streamed) or from the model root (resident).
                 names.add(name)
+                names.add(f"language_model.model.layers.{i}.mlp.experts.{proj}")
+                names.add(f"model.language_model.layers.{i}.mlp.experts.{proj}")
     return frozenset(names)
 
 
@@ -195,9 +208,9 @@ def _unify_shared_bits(
 
 def _fold_nvfp4_tensor_scale(weight: mx.array, global_scale: mx.array) -> mx.array:
     """Scale each expert of a dequantized NVFP4 weight to its real magnitude."""
-    from omlx.patches.muse_spark.muse_spark_model import _NVFP4_GLOBAL_SCALE
-
-    scale = global_scale.astype(mx.float32) * (1.0 / _NVFP4_GLOBAL_SCALE)
+    scale = global_scale.astype(mx.float32) * (
+        1.0 / muse_spark_layout.NVFP4_GLOBAL_SCALE
+    )
     return (weight.astype(mx.float32) * scale[:, None, None]).astype(weight.dtype)
 
 
@@ -446,7 +459,10 @@ def _configure_minimax_shared_expert_layout(config: dict, oq_level: float) -> bo
     """
     if not _is_minimax_m3_config(config):
         return False
-    if int(_LEVEL_BITS.get(oq_level, oq_level)) >= 8:
+    # NVFP4 routed experts can never share a bank with the MXFP8 shared expert.
+    if int(
+        _LEVEL_BITS.get(oq_level, oq_level)
+    ) >= 8 and not minimax_nvfp4.has_nvfp4_routed_experts(config):
         return False
     text_config = config.get("text_config")
     if not isinstance(text_config, dict):
@@ -571,6 +587,30 @@ def _glm_indexer_q8_override(path: str, config: dict) -> dict | None:
     return dict(_GLM_INDEXER_Q8)
 
 
+def _minimax_indexer_q8_override(path: str, config: dict) -> dict | None:
+    """Return the mandatory Q8 spec for MiniMax M3 sparse-attention indexers.
+
+    The indexer picks which key blocks every query attends to, so quantization
+    error changes the selection itself rather than adding noise. Its two
+    projections are about 236M parameters on M3.1, so Q8 adds roughly 0.1 GB.
+    From an MXFP8 source the Q8 floor passes the source bytes through.
+    """
+    if not _is_minimax_m3_config(config):
+        return None
+    path = _normalize_quant_path(path)
+    if not path.endswith(
+        tuple(f".self_attn.{name}" for name in _MINIMAX_INDEXER_PROJECTIONS)
+    ):
+        return None
+    return dict(_GLM_INDEXER_Q8)
+
+
+def _indexer_q8_override(path: str, config: dict) -> dict | None:
+    return _glm_indexer_q8_override(path, config) or _minimax_indexer_q8_override(
+        path, config
+    )
+
+
 def _is_qwen4_exp_ngram_embedding_tensor(path: str, config: dict) -> bool:
     """Return whether *path* is one Qwen4-Exp PLE embedding shard.
 
@@ -631,9 +671,9 @@ def universal_quant_predicate(
     if path in non_quantizable:
         return False
 
-    glm_indexer_override = _glm_indexer_q8_override(path, config)
-    if glm_indexer_override is not None:
-        return glm_indexer_override
+    indexer_override = _indexer_q8_override(path, config)
+    if indexer_override is not None:
+        return indexer_override
 
     tc = config.get("text_config", {})
     num_layers = config.get("num_hidden_layers") or tc.get("num_hidden_layers", 32)
@@ -1199,13 +1239,14 @@ def _build_quant_plan(
     boost_map: dict[str, dict] = {}
     fixed_overrides = fixed_overrides or {}
 
-    # GLM DSA indexers are a format invariant, not an optional sensitivity
-    # boost. Seed them before pricing the plan and never let the bpw cap drop
-    # them. On GLM-5.2 all 22 indexers together are only about 209 MiB at Q8.
+    # GLM DSA and MiniMax indexers are a format invariant, not an optional
+    # sensitivity boost. Seed them before pricing the plan and never let the
+    # bpw cap drop them. On GLM-5.2 all 22 indexers together are only about
+    # 209 MiB at Q8.
     for path in named_shapes:
         if path in fixed_overrides:
             continue
-        override = _glm_indexer_q8_override(path, config)
+        override = _indexer_q8_override(path, config)
         if override is not None:
             boost_map[path] = override
 
@@ -1519,13 +1560,15 @@ def resolve_output_name(
     dtype: str = "bfloat16",
     preserve_mtp: bool = False,
     enhanced: bool = False,
+    preserve_ngram_table: bool = False,
 ) -> str:
     """Generate output model name: strip existing quant suffixes, append oQ tag.
 
     Appends `-fp16` suffix when dtype is float16. bfloat16 is the default and
     produces no dtype suffix (backwards compatible). When preserve_mtp is True,
     appends `-mtp` so the resulting name reflects that mtp.* tensors and
-    config fields were preserved through quantization.
+    config fields were preserved through quantization. `-ngram` marks N-gram
+    lookup tables kept at source precision.
 
     Examples:
         "Qwen3.5-122B-A10B" + 4 + bfloat16 -> "Qwen3.5-122B-A10B-oQ4"
@@ -1533,9 +1576,11 @@ def resolve_output_name(
         "Qwen3.5-122B-A10B" + 4 + float16  -> "Qwen3.5-122B-A10B-oQ4-fp16"
         "Qwen3.5-122B-A10B-oQ6-fp16" + 2 + bfloat16 -> "Qwen3.5-122B-A10B-oQ2"
         "Qwen3.5-27B" + 4 + bfloat16 + preserve_mtp -> "Qwen3.5-27B-oQ4-mtp"
+        "DeepSeek-V4.1-Flash" + 4 + enhanced + preserve_ngram_table
+            + preserve_mtp -> "DeepSeek-V4.1-Flash-oQ4e-ngram-mtp"
     """
     pattern = re.compile(
-        r"-(oQ[\d.]+e?|[0-9]+[_-]?bit|fp\d+|bf\d+|mtp)$",
+        r"-(oQ[\d.]+e?|[0-9]+[_-]?bit|fp\d+|bf\d+|ngram|mtp)$",
         flags=re.IGNORECASE,
     )
     base = model_name
@@ -1548,6 +1593,8 @@ def resolve_output_name(
     suffix = f"-oQ{level_str}{'e' if enhanced else ''}"
     if dtype == "float16":
         suffix += "-fp16"
+    if preserve_ngram_table:
+        suffix += "-ngram"
     if preserve_mtp:
         suffix += "-mtp"
     return f"{base}{suffix}"
@@ -2558,6 +2605,18 @@ class _TrackedTensor:
             recipe=list(self.recipe) + [("reshape", shape)],
         )
 
+    def squeeze(self, axis=None):
+        # Recorded as the equivalent reshape, which replay already supports.
+        if axis is None:
+            axes = {i for i, d in enumerate(self.shape) if d == 1}
+        else:
+            axes = (axis,) if isinstance(axis, int) else axis
+            axes = {a % self.ndim for a in axes}
+            if any(self.shape[a] != 1 for a in axes):
+                raise ValueError("cannot squeeze an axis whose size is not 1")
+        shape = tuple(d for i, d in enumerate(self.shape) if i not in axes)
+        return self.reshape(shape)
+
     def astype(self, dtype):
         if self.transform == "nested_unreplayable":
             return self._unreplayable(dtype=dtype)
@@ -3510,6 +3569,7 @@ def estimate_bpw_and_size(
     oq_level: int,
     group_size: int = 64,
     preserve_mtp: bool = False,
+    preserve_ngram_table: bool = False,
 ) -> dict:
     """Calculate precise effective bpw and output size by scanning actual tensors.
 
@@ -3521,6 +3581,8 @@ def estimate_bpw_and_size(
         preserve_mtp: When True, mtp.* tensors are kept (counted toward
             output size) instead of being skipped. Mirrors the matching
             argument in ``quantize_oq_streaming``.
+        preserve_ngram_table: Price DeepSeek V4.1 Engram tables at their
+            source bytes, as ``quantize_oq_streaming`` stores them.
         oq_level: Target oQ level (base bits).
         group_size: Quantization group size.
 
@@ -3560,7 +3622,7 @@ def estimate_bpw_and_size(
             config,
             mapping,
             preserve_mtp=preserve_mtp,
-            engram_bits=_offload_table_bits(oq_level),
+            engram_bits=None if preserve_ngram_table else _offload_table_bits(oq_level),
         )
         remaining = budget["remaining_weights"]
         # Allocations below oQ4 are not known until calibration. Quote their
@@ -4255,6 +4317,8 @@ def _build_model_sanitizer(
         A function that takes a dict of weights and returns sanitized weights,
         or None if the model class can't be loaded.
     """
+    if _is_muse_spark(config):
+        return muse_spark_layout.sanitizer(config, text_only=text_only)
     architectures = config.get("architectures", [])
     # Detect VLMs by the canonical vision-subconfig predicate (used everywhere
     # else in oq.py), not just the ForConditionalGeneration arch name. OCR VLMs
@@ -4321,14 +4385,6 @@ def _build_model_sanitizer(
                     )
 
                     apply_mlx_vlm_muse_glimmer_compat_patch()
-                if model_type == "muse_spark":
-                    from omlx.patches.mlx_vlm_muse_spark_compat import (
-                        apply_mlx_vlm_muse_spark_compat_patch,
-                    )
-                    from omlx.patches.muse_spark import apply_muse_spark_patch
-
-                    apply_muse_spark_patch()
-                    apply_mlx_vlm_muse_spark_compat_patch()
                 if model_type == "glm5_next":
                     from omlx.patches.mlx_vlm_glm5_next_compat import (
                         apply_mlx_vlm_glm5_next_compat_patch,
@@ -4490,12 +4546,15 @@ def _build_model_sanitizer(
                 )
 
                 _vlm_sanitize._omlx_cast_predicate = glm5_next_cast_predicate
-            if model_type == "muse_spark":
-                from omlx.patches.muse_spark.muse_spark_model import (
-                    cast_predicate as muse_spark_cast_predicate,
-                )
-
-                _vlm_sanitize._omlx_cast_predicate = muse_spark_cast_predicate
+            if model_type in ("minimax_m3", "minimax_m3_vl"):
+                # Take the predicate from the language module the config
+                # resolved to. Importing it by name could load upstream
+                # mlx-vlm's module of the same name ahead of the vendored one.
+                language_cls = getattr(model_module, "LanguageModel", None)
+                language = sys.modules.get(getattr(language_cls, "__module__", ""))
+                predicate = getattr(language, "cast_predicate", None)
+                if predicate is not None:
+                    _vlm_sanitize._omlx_cast_predicate = predicate
 
             logger.info(
                 f"Using mlx-vlm full sanitize chain for "
@@ -4507,8 +4566,6 @@ def _build_model_sanitizer(
             logger.warning(f"mlx-vlm sanitizer not available for a VLM config: {e}")
 
     try:
-        from mlx_lm.utils import _get_classes
-
         if config.get("model_type") == "glm_moe_dsa":
             try:
                 from omlx.patches.glm_moe_dsa import apply_glm_moe_dsa_patch
@@ -4697,6 +4754,17 @@ def _copy_model_sidecars(
         shutil.copy2(py_file, output / py_file.name)
 
 
+def _copy_bundled_drafts(source: Path, output: Path) -> None:
+    """Copy a bundled speculative draft checkpoint next to the output.
+
+    MiniMax M3.1 ships its DSpark draft in ``dspark/``. The draft stays in its
+    source precision: it is small and only affects draft acceptance.
+    """
+    draft = minimax_dspark.bundled_dspark_path(source)
+    if draft is not None:
+        shutil.copytree(draft, output / draft.name, dirs_exist_ok=True)
+
+
 def _build_non_quantizable_set(config: dict) -> set:
     """Find module paths with 2D weights that lack to_quantized() support.
 
@@ -4706,8 +4774,6 @@ def _build_non_quantizable_set(config: dict) -> set:
     quantization. Returns empty set if the model class cannot be loaded.
     """
     try:
-        from mlx_lm.utils import _get_classes
-
         model_class, model_args_class = _get_classes(config)
         args = model_args_class.from_dict(config)
         model = model_class(args)
@@ -4872,6 +4938,11 @@ class _VirtualTensor(NamedTuple):
     dtype: str
     materialize: Callable
     hides: tuple
+    # Optional packed source form: ``load_packed()`` returns (weight, scales)
+    # in the mlx format that ``quant_info`` describes, so the quantizer can
+    # pass the source through instead of re-quantizing the materialized value.
+    quant_info: dict | None = None
+    load_packed: Callable | None = None
 
 
 class _LazyTensorIndex:
@@ -4956,7 +5027,17 @@ class _LazyTensorIndex:
 
         register_virtual_tensors(self, config)
 
-    def register_virtual(self, key, shape, dtype, materializer, *, hides=()):
+    def register_virtual(
+        self,
+        key,
+        shape,
+        dtype,
+        materializer,
+        *,
+        hides=(),
+        quant_info=None,
+        load_packed=None,
+    ):
         """Declare ``key`` as produced on demand by ``materializer``.
 
         ``shape``/``dtype`` describe the logical tensor as sanitize and the
@@ -4964,11 +5045,18 @@ class _LazyTensorIndex:
         ``"BF16"``). ``hides`` lists the on-disk keys it is derived from; they
         stay readable via :meth:`load_source` but disappear from the logical
         view so sanitize never sees the pre-restructure layout.
+
+        ``quant_info`` and ``load_packed`` describe an optional packed form
+        that can be passed through like a native mxfp4/mxfp8 source pair.
         """
+        if (quant_info is None) != (load_packed is None):
+            raise ValueError("quant_info and load_packed must be given together")
         self._virtual[key] = _VirtualTensor(
-            tuple(shape), dtype, materializer, tuple(hides)
+            tuple(shape), dtype, materializer, tuple(hides), quant_info, load_packed
         )
         self._hidden.update(hides)
+        if quant_info is not None:
+            self._src_quant[key] = dict(quant_info)
 
     def materialize_virtual(self, key):
         """Produce a virtual tensor's value."""
@@ -4984,6 +5072,8 @@ class _LazyTensorIndex:
         entry = self._virtual.pop(key, None)
         if entry is None:
             return
+        if entry.quant_info is not None:
+            self._src_quant.pop(key, None)
         still_hidden = set()
         for other in self._virtual.values():
             still_hidden.update(other.hides)
@@ -5191,6 +5281,9 @@ class _LazyTensorIndex:
         source_quant_info. fp8_block scales are expanded from per-block to
         per-32-column-group, mirroring the model sanitize's repeat expansion.
         """
+        virtual = self._virtual.get(wk)
+        if virtual is not None and virtual.load_packed is not None:
+            return virtual.load_packed()
         sk = self._fp8_pairs[wk]
         info = self._src_quant[wk]
         weight_raw = self._load_raw(wk)
@@ -6446,7 +6539,9 @@ def quantize_oq_streaming(
             table can then be quantized separately (its measured
             sensitivity is far below the core's), and a passthrough leaves
             no per-layer quantization entry so loaders treat the shards as
-            plain weights. No effect on other model types.
+            plain weights. DeepSeek V4.1 keeps its Engram tables in the
+            official FP8 storage instead of 4-bit affine. No effect on other
+            model types.
     """
     if oq_level not in OQ_LEVELS:
         raise ValueError(
@@ -6515,6 +6610,7 @@ def quantize_oq_streaming(
             text_only=text_only,
             dtype=dtype,
             progress_callback=progress_callback,
+            preserve_ngram_table=preserve_ngram_table,
         )
     if (
         normalized_model_type in MLX_LM_TEXT_ONLY_MODEL_TYPES
@@ -7073,11 +7169,12 @@ def quantize_oq_streaming(
     pending_scales = {}
     consumed_scales = set()
     upstream_writer = None
-    if _stream_source_model_type(config) == "muse_spark":
-        from omlx.patches.muse_spark.upstream_layout import UpstreamWriter
-
-        # The output loads in mlx-lm's own Muse Spark model as well as oMLX.
-        upstream_writer = UpstreamWriter(config)
+    if _is_muse_spark(config):
+        # oMLX serves Muse Spark with mlx-lm's model, so write its layout.
+        upstream_writer = muse_spark_layout.UpstreamWriter(
+            config,
+            centered_norms=not muse_spark_layout.is_upstream_layout(all_weights.keys()),
+        )
 
     for tensor_name in tensor_names:
         if tensor_name in folded_scales:
@@ -7276,6 +7373,20 @@ def quantize_oq_streaming(
                     {"processed_bytes": processed_bytes, "total_bytes": total_bytes},
                 )
 
+    minimax_nvfp4_experts = _is_minimax_m3_config(
+        config
+    ) and minimax_nvfp4.has_nvfp4_routed_experts(config)
+    if minimax_nvfp4_experts:
+        scale_tensors = minimax_nvfp4.routed_expert_scale_tensors(
+            getattr(all_weights, "_lazy", all_weights), config, per_layer_config
+        )
+        out_shard_data.update(scale_tensors)
+        # mlx-lm applies a projection's global_scale only when its quantization
+        # entry says so.
+        for key in scale_tensors:
+            base = key[: -len(".global_scale")]
+            per_layer_config[base] = {**per_layer_config[base], "global_scale": True}
+
     del all_weights
     mx.synchronize()
     mx.clear_cache()
@@ -7380,6 +7491,11 @@ def quantize_oq_streaming(
         quant_info[key] = val
     output_config["quantization"] = quant_info
     output_config["quantization_config"] = quant_info
+    if minimax_nvfp4_experts:
+        output_config["text_config"] = {
+            **output_config["text_config"],
+            "routed_expert_scales": True,
+        }
     _apply_output_dtype(output_config, dtype)
     with open(output / "config.json", "w") as f:
         json.dump(output_config, f, indent=2, ensure_ascii=False)
@@ -7393,6 +7509,8 @@ def quantize_oq_streaming(
     for name in DECISION_SIDECAR_FILES:
         if (source / name).is_file():
             shutil.copy2(source / name, output / name)
+    if not text_only:
+        _copy_bundled_drafts(source, output)
 
     if mimo_multimodal:
         from .patches.mimo_v2.omnimodal import export_sidecars
@@ -7417,14 +7535,7 @@ _OQE_MAX_SAMPLE_MULTIPLIER = 8
 _OQE_MAX_ADAPTIVE_SAMPLES = 1024
 _OQE_MIN_EXPERT_COUNT = 16
 _OQE_MIN_EXPERT_COUNT_PERCENTILE = 5
-# ScaledSwitchLinear and NVFP4SwitchLinear: Muse Spark experts that carry an
-# NVFP4 tensor scale.
-_OQE_SWITCH_LINEAR_CLASSES = {
-    "SwitchLinear",
-    "QuantizedSwitchLinear",
-    "ScaledSwitchLinear",
-    "NVFP4SwitchLinear",
-}
+_OQE_SWITCH_LINEAR_CLASSES = {"SwitchLinear", "QuantizedSwitchLinear"}
 
 
 def _is_oqe_switch_module(module) -> bool:
@@ -7718,6 +7829,9 @@ def _find_model_layers(model):
     embed_fn = None
     layers = None
 
+    if getattr(model, "model_type", None) == "muse_spark":
+        # mlx-lm's Muse Spark normalizes its token embeddings.
+        return model.model.language_model.embed, model.layers
     if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
         embed_fn = model.model.embed_tokens
         layers = model.model.layers
@@ -8120,6 +8234,13 @@ def _forward_layer_result(block, inputs, mask, position_ids, layer_idx=None):
             )
             return None, None
 
+    if muse_spark_layout is not None and isinstance(
+        block, muse_spark_layout.muse_spark.TransformerBlock
+    ):
+        # mlx-lm's Muse Spark block takes the mask and cache by keyword only.
+        result = block(inputs, mask=mask, cache=None)
+        return (result[0] if isinstance(result, tuple) else result), None
+
     last_exc = None
     for call_args in [
         (inputs, mask, None, position_ids),
@@ -8219,8 +8340,12 @@ def _qdq_weight_only(weight, bits: int, group_size: int, mode: str):
     )
 
 
-def _temporary_quantize_block(block, config, oq_level, group_size: int):
+def _temporary_quantize_block(
+    block, config, oq_level, group_size: int, layer_idx: int | None = None
+):
     """Quantize-dequantize a block using the active predicate configuration."""
+    # Muse Spark NVFP4 experts this level passes through are written unchanged.
+    passthrough = _muse_spark_passthrough_capture_skip(config, oq_level, group_size)
     saved = {}
     for path, module in tree_flatten(block.leaf_modules(), is_leaf=nn.Module.is_module):
         if not hasattr(module, "weight") or not hasattr(module, "to_quantized"):
@@ -8228,6 +8353,12 @@ def _temporary_quantize_block(block, config, oq_level, group_size: int):
         if getattr(module.weight, "ndim", 0) < 2:
             continue
         norm_path = _normalize_quant_path(path)
+        if _is_muse_spark(config):
+            # The fused qkvg_proj takes the one format oQ gives its parts.
+            norm_path = muse_spark_layout.oq_names(norm_path)[0]
+            layer_path = f"{muse_spark_layout.LAYER_PREFIX}{layer_idx}.{norm_path}"
+            if layer_path in passthrough:
+                continue
         bits, gs, mode = _get_predicate_bits(norm_path, config, oq_level, group_size)
         if bits is None or module.weight.shape[-1] % gs != 0:
             continue
@@ -8354,8 +8485,8 @@ class _ImatrixCaptureWrapper(nn.Module):
                 raise exc
             return getattr(module, key)
 
-    # Parents may read parameters by key (Muse Spark checks
-    # ``"global_scale" in proj``), so key lookups reach the wrapped module.
+    # Parents may read parameters by key (``"global_scale" in proj``), so key
+    # lookups reach the wrapped module.
     def __contains__(self, key) -> bool:
         return key in object.__getattribute__(self, "_module")
 
@@ -8764,6 +8895,25 @@ def _collect_mtp_head_imatrix(
         return False
 
 
+def _load_muse_spark_calibration_model(model_path):
+    """The text model of a Muse Spark checkpoint as oMLX serves it."""
+    path = Path(model_path)
+    kwargs = muse_spark_serving.load_kwargs(path, text_only=True)
+    model, _ = load_model(path, lazy=True, strict=False, **kwargs)
+    return model, load_mlx_lm_tokenizer(path)
+
+
+def _oq_imatrix_entries(entries: dict, config: dict) -> dict:
+    """Name calibration statistics after oQ's tensors."""
+    if not _is_muse_spark(config):
+        return entries
+    return {
+        oq_name: entry
+        for name, entry in entries.items()
+        for oq_name in muse_spark_layout.oq_names(name)
+    }
+
+
 def _collect_imatrix_from_model(
     model,
     tokenizer,
@@ -9085,7 +9235,7 @@ def _collect_imatrix_from_model(
                 f"{successful_layer_forwards} layer forwards completed, "
                 "but no hook captured a compatible activation"
             )
-    return collector.entries, metadata
+    return _oq_imatrix_entries(collector.entries, config), metadata
 
 
 # --- Streamed per-layer weight sourcing (layer-streaming imatrix collector) ---
@@ -9134,16 +9284,10 @@ def _streamed_text_args(model_path, config, *, trust_remote_code: bool = False):
         from mlx_vlm.models.glm5_next.language import Glm5NextDecoderLayer
 
         layer_cls = Glm5NextDecoderLayer
-    elif _stream_source_model_type(config) == "muse_spark":
-        # Bare blocks keep BF16 SwitchLinear experts: the NVFP4 pairs are
-        # sourced dequantized and the block applies their tensor scales. The
-        # full config carries the ModelOpt layout the block needs for that.
-        from omlx.patches.muse_spark.muse_spark_model import (
-            ModelArgs,
-            streamed_decoder_layer,
-        )
-
-        return ModelArgs.from_dict(config), streamed_decoder_layer
+    elif _is_muse_spark(config):
+        # mlx-lm's decoder block; calibration_items maps oQ's tensors to it.
+        args = muse_spark_layout.calibration_args(config)
+        return args, muse_spark_layout.calibration_block
     else:
         from mlx_vlm.models.minimax_m3_vl.config import TextConfig
         from mlx_vlm.models.minimax_m3_vl.language import MiniMaxDecoderLayer
@@ -9266,6 +9410,8 @@ def _iter_streamed_layer_blocks(
     )
     for layer_idx in range(args.num_hidden_layers):
         items = _streamed_layer_items(dp, layer_idx, skip_key=skip_key)
+        if _is_muse_spark(config):
+            items = muse_spark_layout.calibration_items(items, layer_idx, config)
         block = layer_cls(args, layer_idx)
         # Freshly constructed modules default to training mode; loaded models
         # run in eval mode. Layer implementations may branch on the flag
@@ -9581,7 +9727,9 @@ def _streamed_sensitivity_layer(
             f"streamed sensitivity: layer {layer_idx} float forward returned "
             f"no output for {type(block).__name__}"
         )
-    saved = _temporary_quantize_block(block, config, oq_level, _OQ_DEFAULT_GROUP_SIZE)
+    saved = _temporary_quantize_block(
+        block, config, oq_level, _OQ_DEFAULT_GROUP_SIZE, layer_idx=layer_idx
+    )
     try:
         out_quant, _ = _forward_layer_result(
             block, state["inputs"], layer_mask, state["position_ids"], layer_idx=layer_idx
@@ -10120,7 +10268,7 @@ def _collect_imatrix_streaming(
         scores = sens_state["scores"] if sens_state is not None else {}
         _log_streamed_sensitivity(sensitivity_oq_level, scores)
         metadata["sensitivity_map"] = scores
-    return collector.entries, metadata
+    return _oq_imatrix_entries(collector.entries, config), metadata
 
 
 def _collect_imatrix(
@@ -10194,7 +10342,9 @@ def _collect_imatrix(
             logger.debug("MTP runtime patch skipped for oQe imatrix: %s", e)
 
     try:
-        if is_vlm:
+        if _is_muse_spark(config):
+            model, tokenizer = _load_muse_spark_calibration_model(model_path)
+        elif is_vlm:
             from mlx_vlm.utils import load_model as vlm_load_model
 
             # Calibration proxies deliberately retain SSD-mapped tensors that
@@ -10498,7 +10648,7 @@ def _measure_sensitivity_from_model(
             continue
 
         saved = _temporary_quantize_block(
-            block, config, oq_level, _OQ_DEFAULT_GROUP_SIZE
+            block, config, oq_level, _OQ_DEFAULT_GROUP_SIZE, layer_idx=layer_idx
         )
         if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
             position_ids["prev_topk_indices"] = prev_aux
@@ -10597,7 +10747,9 @@ def _measure_sensitivity(
             logger.debug(f"mlx-vlm MTP runtime patch skipped for sensitivity: {e}")
 
     try:
-        if is_vlm:
+        if _is_muse_spark(config):
+            model, tokenizer = _load_muse_spark_calibration_model(model_path)
+        elif is_vlm:
             from mlx_vlm.utils import load_model as vlm_load_model
 
             # Sensitivity uses the same proxy representation as imatrix
@@ -11052,7 +11204,9 @@ def _measure_sensitivity_from_quantized_model(
 
     restore_mtp_active = None
     try:
-        if is_vlm:
+        if _is_muse_spark(config):
+            model, tokenizer = _load_muse_spark_calibration_model(model_path)
+        elif is_vlm:
             if has_mtp_heads and has_mtp_weights:
                 try:
                     from omlx.patches.mlx_lm_mtp import is_mtp_active, set_mtp_active
