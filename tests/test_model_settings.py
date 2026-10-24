@@ -752,6 +752,60 @@ class TestModelSettingsManager:
 
         assert merged == {"enable_thinking": True, "custom_flag": "request"}
 
+    @pytest.mark.parametrize("effort", ["low", "medium", "xhigh", 0.5])
+    def test_merge_chat_template_request_kwargs_active_effort_enables_unforced_thinking(
+        self, effort
+    ):
+        """An active request reasoning_effort turns on unforced model enable_thinking=False."""
+        from omlx.model_settings import merge_chat_template_request_kwargs
+
+        settings = ModelSettings(enable_thinking=False)
+        assert merge_chat_template_request_kwargs(
+            settings, {"reasoning_effort": effort}
+        ) == {
+            "enable_thinking": True,
+            "reasoning_effort": effort,
+        }
+
+    @pytest.mark.parametrize("effort", [None, "", "none", "off", "no_think", 0, False])
+    def test_merge_chat_template_request_kwargs_disabled_effort_keeps_thinking_off(
+        self, effort
+    ):
+        """Empty or disabled reasoning_effort preserves model enable_thinking=False."""
+        from omlx.model_settings import merge_chat_template_request_kwargs
+
+        settings = ModelSettings(enable_thinking=False)
+        assert merge_chat_template_request_kwargs(
+            settings, {"reasoning_effort": effort}
+        ) == {
+            "enable_thinking": False,
+            "reasoning_effort": effort,
+        }
+
+    def test_merge_chat_template_request_kwargs_effort_respects_explicit_or_forced_thinking_off(
+        self,
+    ):
+        """Explicit request enable_thinking=False or forced_ct_kwargs wins over reasoning_effort."""
+        from omlx.model_settings import merge_chat_template_request_kwargs
+
+        unforced = ModelSettings(enable_thinking=False)
+        assert merge_chat_template_request_kwargs(
+            unforced, {"enable_thinking": False, "reasoning_effort": "xhigh"}
+        ) == {
+            "enable_thinking": False,
+            "reasoning_effort": "xhigh",
+        }
+
+        forced = ModelSettings(
+            enable_thinking=False, forced_ct_kwargs=["enable_thinking"]
+        )
+        assert merge_chat_template_request_kwargs(
+            forced, {"reasoning_effort": "xhigh"}
+        ) == {
+            "enable_thinking": False,
+            "reasoning_effort": "xhigh",
+        }
+
     @pytest.mark.parametrize("budget", [None, 0, 1])
     @pytest.mark.parametrize("enabled", [None, True, False])
     def test_budget_respects_explicit_thinking_mode(self, budget, enabled):

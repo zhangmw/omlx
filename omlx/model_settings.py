@@ -1898,6 +1898,24 @@ def forced_ct_keys(settings: "ModelSettings | None") -> set[str]:
     return set(settings.forced_ct_kwargs or [])
 
 
+def _is_active_reasoning_effort(value: Any) -> bool:
+    """Return True when a request reasoning_effort explicitly requests reasoning."""
+    if value is None or isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return value > 0
+    if isinstance(value, str):
+        return value.strip().lower() not in {
+            "",
+            "none",
+            "off",
+            "no_think",
+            "false",
+            "0",
+        }
+    return False
+
+
 def merge_chat_template_request_kwargs(
     settings: "ModelSettings | None",
     request_ct_kwargs: "dict[str, Any] | None" = None,
@@ -1908,6 +1926,8 @@ def merge_chat_template_request_kwargs(
       1. ``settings.chat_template_kwargs``
       2. the dedicated ``enable_thinking`` / ``preserve_thinking`` toggles
       3. per-request kwargs, except keys listed in ``forced_ct_kwargs``
+      4. active per-request ``reasoning_effort`` enables thinking when the
+         request did not specify ``enable_thinking`` and thinking is not forced off
     """
     merged: dict[str, Any] = {}
     forced_keys = forced_ct_keys(settings)
@@ -1926,6 +1946,14 @@ def merge_chat_template_request_kwargs(
         for key, value in request_ct_kwargs.items():
             if key not in forced_keys:
                 merged[key] = value
+        if (
+            "enable_thinking" not in request_ct_kwargs
+            and "enable_thinking" not in forced_keys
+            and "reasoning_effort" not in forced_keys
+            and merged.get("enable_thinking") is False
+            and _is_active_reasoning_effort(request_ct_kwargs.get("reasoning_effort"))
+        ):
+            merged["enable_thinking"] = True
 
     return merged
 
