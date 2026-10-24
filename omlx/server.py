@@ -9116,14 +9116,14 @@ async def stream_responses_api(
                         yield ev
 
                 if content_delta:
-                    if reasoning_opened and not reasoning_closed:
-                        for ev in _close_reasoning():
-                            yield ev
-                    for ev in _open_message():
-                        yield ev
                     if tool_filter:
                         content_delta = tool_filter.feed(content_delta)
                     if content_delta:
+                        if reasoning_opened and not reasoning_closed:
+                            for ev in _close_reasoning():
+                                yield ev
+                        for ev in _open_message():
+                            yield ev
                         message_deltas.append(content_delta)
                         seq = stream_state.next_sequence()
                         yield format_sse_event(
@@ -9187,14 +9187,14 @@ async def stream_responses_api(
             for ev in _emit_reasoning_delta(remaining_thinking):
                 yield ev
         if content_delta:
-            if reasoning_opened and not reasoning_closed:
-                for ev in _close_reasoning():
-                    yield ev
-            for ev in _open_message():
-                yield ev
             if tool_filter:
                 content_delta = tool_filter.feed(content_delta)
             if content_delta:
+                if reasoning_opened and not reasoning_closed:
+                    for ev in _close_reasoning():
+                        yield ev
+                for ev in _open_message():
+                    yield ev
                 message_deltas.append(content_delta)
                 seq = stream_state.next_sequence()
                 yield format_sse_event(
@@ -9243,6 +9243,7 @@ async def stream_responses_api(
             accumulated_text,
             leading_only=leading_only,
             truncated=last_output is not None and last_output.finish_reason == "length",
+            start_in_thinking=start_in_thinking,
         )
         extraction = extract_tool_calls_with_thinking(
             thinking_content,
@@ -9284,6 +9285,7 @@ async def stream_responses_api(
             accumulated_text,
             leading_only=leading_only,
             truncated=last_output is not None and last_output.finish_reason == "length",
+            start_in_thinking=start_in_thinking,
         )
         cleaned_text = clean_special_tokens(regular_content) if regular_content else ""
 

@@ -531,3 +531,52 @@ def test_prompt_opened_complete_text_matches_stream(text, truncated):
     assert (
         extract_thinking(text, truncated=truncated, start_in_thinking=True) == streamed
     )
+
+
+@pytest.mark.parametrize(
+    "text, prompt_opened, expected_thinking, expected_content",
+    [
+        (
+            "<think>\nCheck template emitting `<think>\\n\\n</think>\\n\\n` even when thinking is off.\n</think>\n\nFinal answer.",
+            False,
+            "Check template emitting `<think>\\n\\n</think>\\n\\n` even when thinking is off.",
+            "Final answer.",
+        ),
+        (
+            "Check the leading newline after `</think>` and before `<think>` in template.\n</think>\n\nDone.",
+            True,
+            "Check the leading newline after `</think>` and before `<think>` in template.",
+            "Done.",
+        ),
+    ],
+)
+def test_inline_quoted_think_tags_do_not_split_reasoning(
+    text, prompt_opened, expected_thinking, expected_content
+):
+    assert extract_thinking(text, start_in_thinking=prompt_opened) == (
+        expected_thinking,
+        expected_content,
+    )
+    for step in (1, 3, 7):
+        parser = ThinkingParser(start_in_thinking=prompt_opened)
+        thinking_parts = []
+        content_parts = []
+        for idx in range(0, len(text), step):
+            t, c = parser.feed(text[idx : idx + step])
+            thinking_parts.append(t)
+            content_parts.append(c)
+        t, c = parser.finish()
+        thinking_parts.append(t)
+        content_parts.append(c)
+        assert "".join(thinking_parts).strip() == expected_thinking
+        assert "".join(content_parts) == expected_content
+
+
+def test_thinking_parser_strips_separator_newlines_after_close_tag():
+    parser = ThinkingParser(start_in_thinking=True)
+    assert parser.feed("Need a tool.") == ("Need a tool.", "")
+    assert parser.feed("</think>") == ("", "")
+    assert parser.feed("\n\n") == ("", "")
+    assert parser.feed("<tool_call>") == ("", "<tool_call>")
+    assert parser.finish(has_tool_calls=True) == ("", "")
+

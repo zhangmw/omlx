@@ -83,6 +83,25 @@ def test_stream_responses_api_starts_parser_when_prompt_opens_thinking():
         "reasoning summary deltas, not output_text."
     )
 
+    extract_calls = [
+        call
+        for call in ast.walk(node)
+        if (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "extract_thinking"
+        )
+    ]
+    assert extract_calls, "stream_responses_api must call extract_thinking"
+    for call in extract_calls:
+        assert any(
+            keyword.arg == "start_in_thinking" for keyword in call.keywords
+        ), (
+            "stream_responses_api must pass start_in_thinking into "
+            "extract_thinking so post-stream tool extraction matches "
+            "the streaming ThinkingParser start state."
+        )
+
 
 def _called_names(node) -> set[str]:
     return {

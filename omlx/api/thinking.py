@@ -30,6 +30,48 @@ _THINKING_PATTERN = re.compile(r'<think>(.*?)</think>', re.DOTALL)
 _THINKING_TAIL_PATTERN = re.compile(r'^(.*?)</think>', re.DOTALL)
 
 
+def _is_inline_code_tag(before: str, after: str = "") -> bool:
+    """Return True when a think tag is quoted as literal code/text rather than a delimiter."""
+    if before.endswith(("`", '"', "'", "\\n", "\\r", "\\")):
+        return True
+    if after.startswith(("`", '"', "'", "\\n", "\\r")):
+        return True
+    if before.count("```") % 2 == 1:
+        return True
+    line_before = before.rsplit("\n", 1)[-1]
+    if line_before.count("`") % 2 == 1:
+        return True
+    return False
+
+
+def _find_unquoted_tag(text: str, tag: str, start: int = 0) -> int:
+    """Find the first occurrence of ``tag`` at or after ``start`` that is not inline-quoted."""
+    tag_len = len(tag)
+    pos = start
+    while True:
+        idx = text.find(tag, pos)
+        if idx < 0:
+            return -1
+        if not _is_inline_code_tag(text[:idx], text[idx + tag_len :]):
+            return idx
+        pos = idx + tag_len
+
+
+def _extract_unquoted_think_span(text: str) -> Tuple[int, int, str] | None:
+    """Find the first unquoted ``<think>...</think>`` span in ``text``."""
+    open_idx = _find_unquoted_tag(text, _OPEN_TAG)
+    if open_idx < 0:
+        return None
+    close_idx = _find_unquoted_tag(text, _CLOSE_TAG, open_idx + _OPEN_LEN)
+    if close_idx < 0:
+        return None
+    return (
+        open_idx,
+        close_idx + _CLOSE_LEN,
+        text[open_idx + _OPEN_LEN : close_idx],
+    )
+
+
 def _safe_tokenizer_attr(tokenizer, attr: str, default=None):
     if tokenizer is None:
         return default
@@ -224,35 +266,37 @@ def extract_thinking(
 
     # Extract all <think>...</think> blocks
     while True:
-        match = _THINKING_PATTERN.search(remaining)
-        if not match:
+        span = _extract_unquoted_think_span(remaining)
+        if span is None:
             break
-        thinking_parts.append(match.group(1))
-        remaining = remaining[:match.start()] + remaining[match.end():]
+        start, end, inner = span
+        thinking_parts.append(inner)
+        remaining = remaining[:start] + remaining[end:]
 
-    if truncated and _OPEN_TAG in remaining:
-        before, after = remaining.split(_OPEN_TAG, 1)
-        thinking_parts.append(after)
-        remaining = before
+    if truncated:
+        open_idx = _find_unquoted_tag(remaining, _OPEN_TAG)
+        if open_idx >= 0:
+            thinking_parts.append(remaining[open_idx + _OPEN_LEN :])
+            remaining = remaining[:open_idx]
 
     if thinking_parts:
         thinking = "\n".join(thinking_parts).strip()
         return (thinking, remaining.strip())
 
+    close_idx = _find_unquoted_tag(text, _CLOSE_TAG)
+    open_idx = _find_unquoted_tag(text, _OPEN_TAG)
+
     # Handle partial: content before </think> without <think> tag
-    if '</think>' in text and '<think>' not in text:
-        match = _THINKING_TAIL_PATTERN.match(text)
-        if match:
-            thinking = match.group(1).strip()
-            remaining = text[match.end():].strip()
-            return (thinking, remaining)
+    if close_idx >= 0 and open_idx < 0:
+        thinking = text[:close_idx].strip()
+        remaining = text[close_idx + _CLOSE_LEN :].strip()
+        return (thinking, remaining)
 
     # Malformed: <think> opened but never closed. Drop the open tag and
     # treat the remainder as content so the answer body is not empty.
-    if '<think>' in text and '</think>' not in text:
-        idx = text.index('<think>')
-        before = text[:idx]
-        after = text[idx + _OPEN_LEN:]
+    if open_idx >= 0 and close_idx < 0:
+        before = text[:open_idx]
+        after = text[open_idx + _OPEN_LEN :]
         return ("", (before + after).strip())
 
     return ("", text)
@@ -266,7 +310,7 @@ def _extract_leading_thinking(
         body = body[_OPEN_LEN:]
     elif not start_in_thinking:
         return ("", text)
-    end = body.find(_CLOSE_TAG)
+    end = _find_unquoted_tag(body, _CLOSE_TAG)
     if end < 0:
         # Unclosed: thinking when cut off by the length limit, otherwise the
         # same recovery as extract_thinking (the body is the answer).
@@ -312,7 +356,9 @@ class ThinkingParser:
         # the answer body is no longer empty.
         self._close_seen: bool = False
         self._thinking_accumulated: List[str] = []
+        self._content_accumulated: List[str] = []
         self._content_emitted: bool = False
+        self._strip_post_think_newlines: bool = False
 
     def feed(self, text: str) -> Tuple[str, str]:
         """Feed a text chunk, return (thinking_delta, content_delta).
@@ -335,34 +381,62 @@ class ThinkingParser:
 
         i = 0
         while i < len(text):
+            if not self._in_thinking and self._strip_post_think_newlines:
+                if text[i] in ("\r", "\n"):
+                    i += 1
+                    continue
+                self._strip_post_think_newlines = False
             if self._tags_done:
                 content_out.append(text[i:])
                 break
             if text[i] == '<':
                 # Check if this could be a tag start
                 remaining = text[i:]
+                before = (
+                    "".join(self._thinking_accumulated) + "".join(thinking_out)
+                    if self._in_thinking
+                    else "".join(self._content_accumulated) + "".join(content_out)
+                )
 
                 # Leading-only output opens its block only before any text,
                 # which also takes the scheduler's prefix of a prompt-opened block.
-                can_open = not self._leading_only or not self._text_seen
+                # Once inside thinking with text already seen, nested <think> literals
+                # stay in the reasoning text rather than being stripped.
+                can_open = (not self._in_thinking or not self._text_seen) and (
+                    not self._leading_only or not self._text_seen
+                )
                 # Try to match <think>
-                if can_open and remaining.startswith(_OPEN_TAG):
+                if (
+                    can_open
+                    and remaining.startswith(_OPEN_TAG)
+                    and not _is_inline_code_tag(before, remaining[_OPEN_LEN:])
+                ):
                     self._in_thinking = True
+                    self._strip_post_think_newlines = False
                     i += _OPEN_LEN
                     continue
 
-                if can_open and remaining.startswith(_HY3_OPEN_TAG):
+                if (
+                    can_open
+                    and remaining.startswith(_HY3_OPEN_TAG)
+                    and not _is_inline_code_tag(before, remaining[len(_HY3_OPEN_TAG) :])
+                ):
                     self._in_thinking = True
+                    self._strip_post_think_newlines = False
                     i += len(_HY3_OPEN_TAG)
                     continue
 
                 # Try to match </think>
-                if remaining.startswith(_CLOSE_TAG):
+                if remaining.startswith(_CLOSE_TAG) and not _is_inline_code_tag(
+                    before, remaining[_CLOSE_LEN:]
+                ):
                     self._close_thinking()
                     i += _CLOSE_LEN
                     continue
 
-                if remaining.startswith(_HY3_CLOSE_TAG):
+                if remaining.startswith(_HY3_CLOSE_TAG) and not _is_inline_code_tag(
+                    before, remaining[len(_HY3_CLOSE_TAG) :]
+                ):
                     self._close_thinking()
                     i += len(_HY3_CLOSE_TAG)
                     continue
@@ -398,12 +472,14 @@ class ThinkingParser:
         if thinking_delta:
             self._thinking_accumulated.append(thinking_delta)
         if content_delta:
+            self._content_accumulated.append(content_delta)
             self._content_emitted = True
         return (thinking_delta, content_delta)
 
     def _close_thinking(self) -> None:
         self._in_thinking = False
         self._close_seen = True
+        self._strip_post_think_newlines = True
         if self._leading_only:
             self._tags_done = True
 
