@@ -2691,13 +2691,19 @@ _KEEPALIVE_COMPLETION_CHUNK = (
 )
 
 
-def _completion_keepalive_chunk(response_id: str) -> str:
-    """Keepalive frame that shares the stream's completion id."""
+def _completion_keepalive_chunk(response_id: str, model: str) -> str:
+    """Keepalive with the stream's id/model and a current creation timestamp.
+
+    See ``_chat_keepalive_chunk`` for why each identity field must match.
+    """
     return (
-        'data: {"id":"' + response_id + '","object":"text_completion","created":0,'
-        '"model":"keepalive",'
+        'data: {"id":"' + response_id + '","object":"text_completion",'
+        '"created":' + str(int(time.time())) + ","
+        '"model":' + json.dumps(model) + ","
         '"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null}]}\n\n'
     )
+
+
 _KEEPALIVE_ANTHROPIC_PING = 'event: ping\ndata: {"type":"ping"}\n\n'
 
 
@@ -2759,8 +2765,8 @@ def _resolve_keepalive(
     return None
 
 
-def _chat_keepalive_chunk(response_id: str) -> str:
-    """Keepalive frame that shares the stream's completion id.
+def _chat_keepalive_chunk(response_id: str, model: str) -> str:
+    """Keepalive with the stream's id/model and a current creation timestamp.
 
     The static ``_KEEPALIVE_CHAT_CHUNK`` carries a sentinel id
     (``chatcmpl-keepalive``) that differs from the real completion chunks.
@@ -2772,13 +2778,20 @@ def _chat_keepalive_chunk(response_id: str) -> str:
     those clients while remaining a parseable data event for clients that can't
     handle SSE comment lines.
 
+    Callers pass ``request.model`` because every real chunk carries it: clients
+    that latch the stream's model and ``created`` from the first chunk would
+    otherwise report the sentinel ``"keepalive"`` model and epoch 0. The frame
+    is built when the stream is set up, so ``created`` is stamped then, just as
+    each real chunk stamps its own creation time.
+
     The delta must also carry ``"role":"assistant"`` — see the comment on
     ``_KEEPALIVE_CHAT_CHUNK`` (accumulators that type the stream from the
     first chunk's role drop tool_call_chunks without it, #2074).
     """
     return (
         'data: {"id":"' + response_id + '","object":"chat.completion.chunk",'
-        '"created":0,"model":"keepalive",'
+        '"created":' + str(int(time.time())) + ","
+        '"model":' + json.dumps(model) + ","
         '"choices":[{"index":0,"delta":{"role":"assistant","content":""},'
         '"finish_reason":null}]}\n\n'
     )
@@ -3597,7 +3610,7 @@ async def _create_markitdown_chat_completion(
         response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
         keepalive = _resolve_keepalive("openai_chat")
         if keepalive == _KEEPALIVE_CHAT_CHUNK:
-            keepalive = _chat_keepalive_chunk(response_id)
+            keepalive = _chat_keepalive_chunk(response_id, request.model)
         markdown_chunks = stream_messages_to_markdown_async(
             request.messages,
             global_settings=_server_state.global_settings,
@@ -4502,7 +4515,7 @@ async def create_completion(
             response_id = f"cmpl-{uuid.uuid4().hex[:8]}"
             keepalive = _resolve_keepalive("openai_completion")
             if keepalive == _KEEPALIVE_COMPLETION_CHUNK:
-                keepalive = _completion_keepalive_chunk(response_id)
+                keepalive = _completion_keepalive_chunk(response_id, request.model)
             return StreamingResponse(
                 _release_after_stream(
                     _with_request_disconnect_abort(
@@ -5155,7 +5168,7 @@ async def create_chat_completion(
             response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
             keepalive = _resolve_keepalive("openai_chat")
             if keepalive == _KEEPALIVE_CHAT_CHUNK:
-                keepalive = _chat_keepalive_chunk(response_id)
+                keepalive = _chat_keepalive_chunk(response_id, request.model)
             sse_headers = {
                 "X-Accel-Buffering": "no",
                 "Cache-Control": "no-cache",
@@ -5244,9 +5257,8 @@ async def create_chat_completion(
                 raw_text,
                 leading_only=_leading_thinking_only(engine),
                 truncated=output.finish_reason == "length",
-                start_in_thinking=(
-                    output.finish_reason == "length"
-                    and _chat_prompt_opens_thinking(engine, messages, chat_kwargs)
+                start_in_thinking=_chat_prompt_opens_thinking(
+                    engine, messages, chat_kwargs
                 ),
             )
             cleaned_thinking = sanitize_tool_call_markup(
@@ -7881,9 +7893,8 @@ async def create_anthropic_message(
                 raw_text,
                 leading_only=_leading_thinking_only(engine),
                 truncated=output.finish_reason == "length",
-                start_in_thinking=(
-                    output.finish_reason == "length"
-                    and _chat_prompt_opens_thinking(engine, messages, chat_kwargs)
+                start_in_thinking=_chat_prompt_opens_thinking(
+                    engine, messages, chat_kwargs
                 ),
             )
             cleaned_thinking = sanitize_tool_call_markup(
@@ -8600,7 +8611,6 @@ async def create_response(
                                 model_load_duration=model_load_duration,
                                 resolved_model=resolved_model,
                                 response_format=response_format,
-                                native_reasoning=native_reasoning,
                                 namespace_aliases=namespace_aliases,
                                 stream_state=stream_state,
                                 **chat_kwargs,
@@ -8662,9 +8672,8 @@ async def create_response(
                 raw_text,
                 leading_only=_leading_thinking_only(engine),
                 truncated=output.finish_reason == "length",
-                start_in_thinking=(
-                    output.finish_reason == "length"
-                    and _chat_prompt_opens_thinking(engine, messages, chat_kwargs)
+                start_in_thinking=_chat_prompt_opens_thinking(
+                    engine, messages, chat_kwargs
                 ),
             )
 
@@ -8809,7 +8818,6 @@ async def stream_responses_api(
     model_load_duration: float = 0.0,
     resolved_model: Optional[str] = None,
     response_format=None,
-    native_reasoning: bool = False,
     namespace_aliases: Optional[dict] = None,
     stream_state: _ResponsesStreamState | None = None,
     **kwargs,
@@ -8826,19 +8834,19 @@ async def stream_responses_api(
     has_tools = bool(kwargs.get("tools"))
     # Some templates open the thinking block in the prompt itself, so the
     # generated text starts with reasoning body and only later emits </think>.
-    start_in_thinking = native_reasoning
-    if not start_in_thinking:
-        try:
-            tokenizer = getattr(engine, "tokenizer", None)
-            if tokenizer is not None:
-                prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
-                    engine, messages, kwargs
-                )
-                start_in_thinking, _ = prompt_opens_thinking(
-                    tokenizer, prompt, prompt_token_ids=prompt_token_ids
-                )
-        except Exception as exc:
-            logger.debug("Could not detect Responses stream thinking state: %s", exc)
+    # Template-level preserve_thinking does not imply this prompt leaves it open.
+    start_in_thinking = False
+    try:
+        tokenizer = getattr(engine, "tokenizer", None)
+        if tokenizer is not None:
+            prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
+                engine, messages, kwargs
+            )
+            start_in_thinking, _ = prompt_opens_thinking(
+                tokenizer, prompt, prompt_token_ids=prompt_token_ids
+            )
+    except Exception as exc:
+        logger.debug("Could not detect Responses stream thinking state: %s", exc)
     leading_only = _leading_thinking_only(engine)
     thinking_parser = ThinkingParser(
         start_in_thinking=start_in_thinking, leading_only=leading_only
