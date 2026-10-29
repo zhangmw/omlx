@@ -139,6 +139,7 @@ class FakeStreamingCore:
             finished=False,
             finish_reason=None,
             tool_calls=None,
+            logprobs=None,
             cached_tokens=0,
         )
 
@@ -190,6 +191,7 @@ class TestVLMStreamingCleanup:
                     finished=True,
                     finish_reason="length",
                     tool_calls=None,
+                    logprobs=None,
                     cached_tokens=0,
                     generated_at=10.0,
                     generated_until=12.0,
@@ -237,6 +239,7 @@ class TestVLMToolForwarding:
             finished=streaming,
             finish_reason="stop",
             tool_calls=None,
+            logprobs=None,
             cached_tokens=0,
             first_token_at=None,
         )
@@ -2085,6 +2088,20 @@ class TestFormatMessagesForVLMTemplate:
         ]
         assert image_ranges == [(0, 2)]
 
+    def test_text_before_image_keeps_image_first_layout(self):
+        """Text before a single image keeps the image-first layout."""
+        engine = _make_loaded_engine(model_type="phi3_v")
+        image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,a"}}
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": "Describe."}, image]}
+        ]
+
+        formatted, _ = engine._format_messages_for_vlm_template(
+            messages, num_images=1
+        )
+
+        assert formatted[0]["content"] == "<|image_1|>Describe."
+
     def test_fallback_inserts_first_user_when_no_explicit_parts(self):
         """Legacy path: num_images without explicit image parts still injects once."""
         engine = _make_loaded_engine(model_type="qwen3_5")
@@ -3260,6 +3277,7 @@ class TestVLMEngineFrequencyPenalty:
             completion_tokens=2,
             finish_reason="stop",
             tool_calls=None,
+            logprobs=None,
             cached_tokens=0,
             first_token_at=None,
         )
@@ -3336,6 +3354,7 @@ class TestVLMEngineFrequencyPenalty:
                 finished=True,
                 finish_reason="stop",
                 tool_calls=None,
+                logprobs=None,
                 cached_tokens=0,
             )
 
