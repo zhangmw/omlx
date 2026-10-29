@@ -73,6 +73,16 @@ struct AvailableUpdate: Equatable, Identifiable, Sendable {
 final class UpdateController {
     static let stateDidChangeNotification = Notification.Name("OMLXUpdateControllerStateDidChange")
 
+    /// Smellycat fork (owner, 2026-10-29: "彻底关掉"): an official release would replace this
+    /// build and drop its patches, so the fork never checks, downloads, stages or installs updates.
+    /// Upgrades come only from rebuilding `zhangmw/omlx`.
+    static let updatesDisabled = true
+    private var updatesDisabledMessage: String {
+        String(localized: "update.error.disabled_in_fork",
+               defaultValue: "Updates are disabled in this build. Upgrade by rebuilding the fork.",
+               comment: "Shown when the user checks for updates in the Smellycat fork build")
+    }
+
     enum CheckState: Equatable, Sendable {
         case idle(lastChecked: Date?)
         case checking
@@ -100,6 +110,7 @@ final class UpdateController {
     }
     var autoCheck: Bool {
         didSet {
+            if Self.updatesDisabled && autoCheck { autoCheck = false; return }
             guard !suspendPersist else { return }
             persist()
             if autoCheck {
@@ -118,6 +129,7 @@ final class UpdateController {
     /// It never installs on its own.
     var backgroundDownload: Bool {
         didSet {
+            if Self.updatesDisabled && backgroundDownload { backgroundDownload = false; return }
             guard !suspendPersist else { return }
             persist()
             if backgroundDownload {
@@ -165,9 +177,9 @@ final class UpdateController {
             channel: .stable, autoCheck: true, autoNotify: false, backgroundDownload: true
         )
         self.channel = prefs.channel
-        self.autoCheck = prefs.autoCheck
-        self.autoNotify = prefs.autoNotify
-        self.backgroundDownload = prefs.backgroundDownload
+        self.autoCheck = prefs.autoCheck && !Self.updatesDisabled
+        self.autoNotify = prefs.autoNotify && !Self.updatesDisabled
+        self.backgroundDownload = prefs.backgroundDownload && !Self.updatesDisabled
         self.deferredPromptVersion = prefs.deferredPromptVersion
         self.suspendPersist = false
     }
@@ -177,7 +189,8 @@ final class UpdateController {
     /// background check.
     func bootstrap() {
         // Only a check surfaces a staged bundle, so keep one only when checks run.
-        AppUpdater.cleanupStaged(currentVersion: currentVersion, keepPending: autoCheck)
+        AppUpdater.cleanupStaged(currentVersion: currentVersion, keepPending: autoCheck && !Self.updatesDisabled)
+        guard !Self.updatesDisabled else { return }
         if autoCheck {
             backgroundCheck()
             scheduleBackgroundChecker()
@@ -194,6 +207,13 @@ final class UpdateController {
 
     /// User-initiated check.
     func checkForUpdates() {
+        if Self.updatesDisabled {
+            checkTask?.cancel()
+            cancelDownload()
+            state = .idle(lastChecked: nil)
+            lastError = updatesDisabledMessage
+            return
+        }
         checkTask?.cancel()
         // The check can pick another release, e.g. after a channel change.
         cancelDownload()
@@ -248,6 +268,7 @@ final class UpdateController {
     }
 
     private func installAndRestart(matchingVersion: String?) {
+        guard !Self.updatesDisabled else { lastError = updatesDisabledMessage; return }
         switch state {
         case .available(let info):
             guard matchingVersion == nil || matchingVersion == info.version else { return }
@@ -266,6 +287,7 @@ final class UpdateController {
     }
 
     private func performSwap(version: String) {
+        guard !Self.updatesDisabled else { return }
         // A check can replace or discard the staged bundle before a deferred swap runs.
         guard case .ready(let ready) = state, ready.version == version else { return }
         if AppUpdater.performSwapAndRelaunch() {
@@ -289,6 +311,7 @@ final class UpdateController {
     // MARK: - Internals
 
     private func backgroundCheck() {
+        guard !Self.updatesDisabled else { return }
         // Leave a running download alone; the next daily check catches up.
         guard updater == nil else { return }
         checkTask?.cancel()
@@ -310,6 +333,7 @@ final class UpdateController {
     }
 
     private func runCheck(userInitiated: Bool) async {
+        guard !Self.updatesDisabled else { return }
         do {
             let result = try await ReleasesChecker.check(
                 currentVersion: currentVersion,
@@ -388,6 +412,7 @@ final class UpdateController {
         autoInstall: Bool,
         notifyWhenDone: Bool = false
     ) {
+        guard !Self.updatesDisabled else { return }
         cancelDownload()
         backgroundDownloadInfo = autoInstall ? nil : info
         let generation = downloadGeneration

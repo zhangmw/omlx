@@ -150,7 +150,8 @@ final class UpdateControllerPrefsTests: XCTestCase {
         ).write(to: url)
 
         let controller = UpdateController(storeURL: url, currentVersion: "0.0.0")
-        XCTAssertTrue(controller.autoNotify)
+        // Smellycat fork: updates are disabled, so a migrated notify pref never turns on.
+        XCTAssertFalse(controller.autoNotify)
 
         controller.autoNotify = false
 
@@ -162,8 +163,8 @@ final class UpdateControllerPrefsTests: XCTestCase {
     }
 
     /// The legacy `autoDownload` key was the old background download toggle.
-    /// A saved `false` keeps it off, and prefs without either key default to on.
-    func testBackgroundDownloadHonorsLegacyKeyAndDefaultsOn() throws {
+    /// Smellycat fork: background download stays off whatever the saved prefs say.
+    func testBackgroundDownloadStaysOffInFork() throws {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("omlx-update-prefs-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -180,9 +181,36 @@ final class UpdateControllerPrefsTests: XCTestCase {
             #"{"channel":"stable","autoCheck":true,"autoNotify":false}"#.utf8
         ).write(to: current)
         let controller = UpdateController(storeURL: current, currentVersion: "0.0.0")
-        XCTAssertTrue(controller.backgroundDownload)
+        XCTAssertFalse(controller.backgroundDownload)
 
-        controller.backgroundDownload = false
+        controller.backgroundDownload = true
+        XCTAssertFalse(controller.backgroundDownload)
         XCTAssertFalse(UpdateController(storeURL: current, currentVersion: "0.0.0").backgroundDownload)
+    }
+
+    /// Smellycat fork: an official release would replace the fork and its patches, so neither
+    /// a background nor a user-initiated check runs, and the toggles cannot turn checking on.
+    func testForkNeverChecksForUpdates() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omlx-update-prefs-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let url = dir.appendingPathComponent("update-prefs.json")
+        try Data(
+            #"{"channel":"stable","autoCheck":true,"autoNotify":true,"backgroundDownload":true}"#.utf8
+        ).write(to: url)
+        let controller = UpdateController(storeURL: url, currentVersion: "0.0.0")
+        XCTAssertTrue(UpdateController.updatesDisabled)
+        XCTAssertFalse(controller.autoCheck)
+        XCTAssertFalse(controller.autoNotify)
+        XCTAssertFalse(controller.backgroundDownload)
+
+        controller.autoCheck = true
+        XCTAssertFalse(controller.autoCheck)
+
+        controller.checkForUpdates()
+        XCTAssertEqual(controller.state, .idle(lastChecked: nil))
+        XCTAssertNotNil(controller.lastError)
     }
 }
