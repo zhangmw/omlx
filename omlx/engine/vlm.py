@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
+import numpy as np
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import (
@@ -59,9 +60,10 @@ from ..models.vlm import VLMModelAdapter
 from ..patches import qwen35_packed_linear
 from ..patches.gemma4_audio import apply_gemma4_audio_patch
 from ..patches.mlx_lm_mtp import drafter_target
+from ..patches.mlx_vlm_minimax_m3_compat import a8 as minimax_a8
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
 from ..patches.muse_spark import model as muse_spark_model
-from ..prefill_helper.adapters import adapter_for as stage_adapter_for
+from ..prefill_helper.adapters import adapter_for_model as stage_adapter_for
 from ..prefill_helper.manager import PrefillHelperManager
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..speculative.dflash import attach_drafter, detach_drafter
@@ -1656,9 +1658,6 @@ def _audio_feature_cache_key_ranges(
     hashed without its batch padding (clips are padded to the longest one in
     the request), so a clip keeps its key when a later turn adds a longer one.
     """
-    import hashlib
-
-    import numpy as np
 
     def _to_np(value):
         if isinstance(value, mx.array):
@@ -2523,7 +2522,7 @@ class VLMBatchedEngine(BaseEngine):
         await self._engine.engine.start()
 
         scheduler = self._engine.engine.scheduler
-        stage_adapter = stage_adapter_for(self.model_type)
+        stage_adapter = stage_adapter_for(self.model_type, "vlm", self._model_name)
         if stage_adapter is not None:
             self._prefill_helper = PrefillHelperManager(
                 model_path=self._model_name,
@@ -2533,6 +2532,7 @@ class VLMBatchedEngine(BaseEngine):
                 attach=scheduler.attach_prefill_helper,
                 chunk_tokens=scheduler._base_prefill_step_size(0, 1 << 30),
             )
+            scheduler._prefill_helper_retry = self._prefill_helper.retry_if_offline
             self.configure_prefill_helper(self._model_settings)
 
         # TurboQuant KV cache
@@ -2712,7 +2712,15 @@ class VLMBatchedEngine(BaseEngine):
         # because it quantizes activations to INT8, which changes numerics;
         # the patch itself falls through for anything it cannot route.
         # DeepSeek V4.1 applies the setting in its own loader.
-        if a8_prefill_on(self._model_settings) and self.model_type != "deepseek_v41":
+        a8_on = a8_prefill_on(self._model_settings)
+        if a8_on and self.model_type in MINIMAX_M3_MODEL_TYPES:
+            tagged = minimax_a8.tag(
+                self._vlm_model,
+                int(getattr(self._model_settings, "a8_prefill_min_tokens", 128)),
+            )
+            if tagged:
+                logger.info("MiniMax A8 prefill on %d modules", tagged)
+        elif a8_on and self.model_type != "deepseek_v41":
             try:
                 from ..patches.qwen35_oq_a8 import apply_qwen35_oq_a8_patch
 
@@ -2780,6 +2788,17 @@ class VLMBatchedEngine(BaseEngine):
                 apply_qwen35_ragged_decode_patch()
             except Exception:
                 logger.debug("qwen3_5 ragged decode patch not applied", exc_info=True)
+
+        # Padded batches the ragged/verify kernels refuse -> batch-1 attention
+        # per row. Applied after the patches above so it wraps them.
+        try:
+            from ..patches.qwen35_padded_row_attention import (
+                apply_qwen35_padded_row_attention_patch,
+            )
+
+            apply_qwen35_padded_row_attention_patch()
+        except Exception:
+            logger.debug("qwen3_5 padded-row attention patch not applied", exc_info=True)
         scheduler.refresh_ssd_layer_signature()
 
         # SpecPrefill: load draft model and pass to scheduler
@@ -3179,7 +3198,7 @@ class VLMBatchedEngine(BaseEngine):
         num_images: int,
         num_audios: int = 0,
         num_videos: int = 0,
-    ) -> tuple[list[dict[str, Any]], list[tuple[int, int]]]:
+    ) -> tuple[list[dict[str, Any] | str], list[tuple[int, int]]]:
         """Format VLM messages with image/audio/video tokens on media-bearing user turns."""
         from mlx_vlm.prompt_utils import extract_text_from_content, get_message_json
 
@@ -3216,7 +3235,7 @@ class VLMBatchedEngine(BaseEngine):
         remaining_audios = num_audios
         assigned_fallback_images = False
         assigned_fallback_audios = False
-        formatted_messages: list[dict[str, Any]] = []
+        formatted_messages: list[dict[str, Any] | str] = []
         image_message_ranges: list[tuple[int, int]] = []
 
         for idx, msg in enumerate(messages):
@@ -3461,6 +3480,11 @@ class VLMBatchedEngine(BaseEngine):
                     num_images=msg_num_images,
                     num_audios=msg_num_audios,
                 )
+                # Prompt-only message formats render a plain string instead of a
+                # role/content dict; there is no content list to collapse.
+                if isinstance(formatted, str):
+                    formatted_messages.append(formatted)
+                    continue
                 # Collapse text-only list content to plain string so that
                 # simplified chat templates (without render_content macro)
                 # can handle it. Image/audio parts stay as a list.
@@ -4218,6 +4242,11 @@ class VLMBatchedEngine(BaseEngine):
         # _format_messages_for_vlm_template(), so a residual key can survive
         # formatting; the chat template must never see the non-standard field.
         detect_and_strip_partial(formatted_messages)
+        # Prompt-only formats have no chat template. Like mlx-vlm
+        # apply_chat_template(), use the last rendered message as the prompt.
+        prompt_only = bool(formatted_messages) and all(
+            isinstance(message, str) for message in formatted_messages
+        )
         template_kwargs = {
             "tokenize": False,
             "add_generation_prompt": not is_partial,
@@ -4235,51 +4264,54 @@ class VLMBatchedEngine(BaseEngine):
         _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
 
         template_target = self._chat_template_target(model_type)
-        try:
-            prompt = apply_chat_template_with_reasoning_effort_fallback(
-                template_target,
-                formatted_messages,
-                template_kwargs,
-                is_harmony=model_type == "gpt_oss",
-            )
-        except TypeError:
-            # Fallback: template doesn't support some kwargs
-            if chat_template_kwargs:
-                for key in chat_template_kwargs:
-                    template_kwargs.pop(key, None)
-            template_kwargs.pop("enable_thinking", None)
-            prompt = template_target.apply_chat_template(
-                formatted_messages, **template_kwargs
-            )
-        except ValueError as exc:
-            if not _is_missing_chat_template_error(exc):
-                raise
-            # Processor/tokenizer has apply_chat_template but no chat_template
-            # set. Some OCR checkpoints (e.g. raw baidu/Unlimited-OCR) ship no
-            # chat template at all. mlx-vlm's get_chat_template handles this by
-            # rendering the messages into a plain prompt (the <image> tokens are
-            # already in the message content from get_message_json), preferring
-            # processor.chat_template -> processor.tokenizer.chat_template ->
-            # plain rendering, so it subsumes the tokenizer fallback too.
-            template_kwargs.pop("tokenize", None)
-            template_kwargs.pop("add_generation_prompt", None)
-            # get_chat_template() has no continue_final_message equivalent, so
-            # partial mode cannot be honoured on this fallback. Drop the kwarg
-            # and say so rather than passing it through as an unknown argument.
-            template_kwargs.pop("continue_final_message", None)
-            if is_partial:
-                logger.warning(
-                    "Partial mode requested but %s exposes no chat template; "
-                    "mlx-vlm plain rendering always starts a new assistant "
-                    "turn, so the final message will not be continued.",
-                    self._model_name,
+        if prompt_only:
+            prompt = formatted_messages[-1]
+        else:
+            try:
+                prompt = apply_chat_template_with_reasoning_effort_fallback(
+                    template_target,
+                    formatted_messages,
+                    template_kwargs,
+                    is_harmony=model_type == "gpt_oss",
                 )
-            prompt = get_chat_template(
-                self._processor,
-                formatted_messages,
-                add_generation_prompt=True,
-                **template_kwargs,
-            )
+            except TypeError:
+                # Fallback: template doesn't support some kwargs
+                if chat_template_kwargs:
+                    for key in chat_template_kwargs:
+                        template_kwargs.pop(key, None)
+                template_kwargs.pop("enable_thinking", None)
+                prompt = template_target.apply_chat_template(
+                    formatted_messages, **template_kwargs
+                )
+            except ValueError as exc:
+                if not _is_missing_chat_template_error(exc):
+                    raise
+                # Processor/tokenizer has apply_chat_template but no chat_template
+                # set. Some OCR checkpoints (e.g. raw baidu/Unlimited-OCR) ship no
+                # chat template at all. mlx-vlm's get_chat_template handles this by
+                # rendering the messages into a plain prompt (the <image> tokens are
+                # already in the message content from get_message_json), preferring
+                # processor.chat_template -> processor.tokenizer.chat_template ->
+                # plain rendering, so it subsumes the tokenizer fallback too.
+                template_kwargs.pop("tokenize", None)
+                template_kwargs.pop("add_generation_prompt", None)
+                # get_chat_template() has no continue_final_message equivalent, so
+                # partial mode cannot be honoured on this fallback. Drop the kwarg
+                # and say so rather than passing it through as an unknown argument.
+                template_kwargs.pop("continue_final_message", None)
+                if is_partial:
+                    logger.warning(
+                        "Partial mode requested but %s exposes no chat template; "
+                        "mlx-vlm plain rendering always starts a new assistant "
+                        "turn, so the final message will not be continued.",
+                        self._model_name,
+                    )
+                prompt = get_chat_template(
+                    self._processor,
+                    formatted_messages,
+                    add_generation_prompt=True,
+                    **template_kwargs,
+                )
 
         # Images with cached features and grids skip the image processor.
         fast_cached_features = None
@@ -4444,9 +4476,12 @@ class VLMBatchedEngine(BaseEngine):
         }
 
         # Check for any multimodal inputs. Most processors expose audio as
-        # ``input_features``; MiMo's tokenizer produces discrete ``audio_codes``.
+        # ``input_features``; MiMo's tokenizer produces discrete
+        # ``audio_codes``, and Nemotron-3 Nano Omni passes raw waveforms as
+        # ``sound_clips``.
         has_audio = any(
-            key in extra_model_inputs for key in ("input_features", "audio_codes")
+            key in extra_model_inputs
+            for key in ("input_features", "audio_codes", "sound_clips")
         )
         has_video = extra_model_inputs.get("pixel_values_videos") is not None
         has_multimodal = (
@@ -4664,6 +4699,32 @@ class VLMBatchedEngine(BaseEngine):
                     token_ids,
                     extra_model_inputs["audio_codes"],
                     self._vlm_model.config.audio_token_id,
+                    image_ranges,
+                )
+                image_cache_key_start = image_cache_key_ranges[0][0]
+                image_hash = image_cache_key_ranges[-1][1]
+            elif has_audio and "sound_clips" in extra_model_inputs:
+                # Nemotron returns raw float32 waveforms. Right-pad them into
+                # one masked batch so each clip keys on its own samples.
+                clips = [
+                    np.asarray(c, dtype=np.float32).reshape(-1)
+                    for c in extra_model_inputs["sound_clips"]
+                ]
+                # Never empty: the processor omits the key when audio is None.
+                width = max(len(c) for c in clips)
+                padded = np.zeros((len(clips), width), dtype=np.float32)
+                mask = np.zeros((len(clips), width), dtype=bool)
+                for i, c in enumerate(clips):
+                    padded[i, : len(c)] = c
+                    mask[i, : len(c)] = True
+                image_ranges = image_cache_key_ranges
+                if image_hash is not None and not image_ranges:
+                    image_ranges = [(0, image_hash)]
+                image_cache_key_ranges = _audio_feature_cache_key_ranges(
+                    token_ids,
+                    padded,
+                    mask,
+                    getattr(self._vlm_model.config, "sound_context_token_id", None),
                     image_ranges,
                 )
                 image_cache_key_start = image_cache_key_ranges[0][0]
@@ -6200,6 +6261,25 @@ class VLMBatchedEngine(BaseEngine):
         if self._engine:
             return self._engine.get_cache_stats()
         return None
+
+    async def abort_request(
+        self,
+        request_id: str,
+        *,
+        reason: str | None = None,
+        error_code: str | None = None,
+    ) -> bool:
+        """Abort one live request; False when it is unknown or already finished."""
+        core = self._engine.engine if self._engine else None
+        if (
+            core is None
+            or request_id not in core._output_collectors
+            or request_id in core._finished_at
+        ):
+            return False
+        return await core.abort_request(
+            request_id, reason=reason, error_code=error_code
+        )
 
     async def abort_all_requests(
         self,

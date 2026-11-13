@@ -1356,6 +1356,9 @@ class SplashEngine(BaseEngine):
                 "--cache-dir",
                 str(options.cache_dir),
             ]
+        else:
+            # Without the flag Splash keeps its own auto-sized SSD cache.
+            command += ["--max-cache-disk", "0"]
         return command
 
     async def start(self) -> None:
@@ -1401,11 +1404,17 @@ class SplashEngine(BaseEngine):
         """Keep the last /status snapshot for the synchronous getters."""
         if self._client is None:
             return
+        task = asyncio.current_task()
+        cancelling = task.cancelling()
         try:
             response = await self._client.get("/status", timeout=2)
             response.raise_for_status()
             data = response.json()
         except Exception:
+            # Older anyio turns a cancel that lands with the request deadline
+            # into a timeout error; keep it a cancel so stop() can finish.
+            if task.cancelling() > cancelling:
+                raise asyncio.CancelledError from None
             logger.debug("Splash: failed to fetch /status", exc_info=True)
             return
         if not isinstance(data, dict):
@@ -1775,7 +1784,8 @@ class SplashEngine(BaseEngine):
     def benchmark_endpoint(self) -> dict[str, Any]:
         """Splash's own API, for the admin benchmark's chat-endpoint path.
 
-        Thinking is off so the benchmark measures plain prefill and decode.
+        Thinking is off so the benchmark measures plain prefill and decode, and
+        EOS is ignored so each test decodes its full token budget.
         """
         if self._process is None or self._process.poll() is not None:
             raise RuntimeError("Splash engine is not started")
@@ -1783,7 +1793,7 @@ class SplashEngine(BaseEngine):
             "base_url": f"{self._base_url}/v1",
             "api_key": self._api_key,
             "model": self._repo_id,
-            "extra_body": {"reasoning_effort": "none"},
+            "extra_body": {"reasoning_effort": "none", "ignore_eos": True},
         }
 
     def reserved_bytes(self) -> int:
