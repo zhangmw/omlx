@@ -82,6 +82,10 @@ from .model_settings import (
     ane_prefill_fraction,
     validate_ane_prefill,
 )
+from .patches.inkling2.dspark import (
+    bundled_inkling2_dspark_path,
+    load_inkling2_dspark_drafter,
+)
 from .patches.minimax_m3_dspark import bundled_dspark_path, load_minimax_dspark_drafter
 from .patches.qwen35_yarn import yarn_factor
 from .prefill_helper.adapters import adapter_for_model as prefill_stage_adapter
@@ -718,6 +722,14 @@ class EnginePool:
             dspark_path = bundled_dspark_path(entry.model_path)
             if dspark_path is not None:
                 extra += self._dflash_drafter_estimated_bytes(str(dspark_path), None)
+        elif (
+            getattr(runtime_settings, "mtp_enabled", False)
+            and entry.config_model_type == "inkling2"
+        ):
+            draft = bundled_inkling2_dspark_path(entry.model_path)
+            if draft is not None:
+                # BF16 draft weights plus the folded [vocab, rank] Markov head.
+                extra += draft.stat().st_size + 201024 * 256 * 2
         return base + extra
 
     def _dflash_drafter_estimated_bytes(
@@ -2385,6 +2397,7 @@ class EnginePool:
                 max_context=requested_context,
                 max_memory_bytes=budget,
                 kv_format=integrations.splash_kv_format,
+                activations=integrations.splash_activations,
                 ane_prefill=integrations.splash_ane_prefill,
                 cache_disk_bytes=cache_disk_bytes,
                 cache_dir=cache_dir,
@@ -3259,7 +3272,7 @@ class EnginePool:
         evicted_any = False
         evicted_count = 0
         reclaim_attempted = False
-        slots_release_attempted = False
+        slots_exhausted = False
         slots_freed = 0
         ane_release_attempted = False
         hot_cache_attempted = False
@@ -3334,15 +3347,17 @@ class EnginePool:
                     )
                     continue
 
-                if not slots_release_attempted:
+                if not slots_exhausted:
                     # The requesting model's MoE offload slots return at its next
                     # decode step, so they go before cached prefixes and models.
-                    slots_release_attempted = True
-                    slots_freed = await self._release_offload_slots_for_headroom(
-                        exclude_model_id, request_id
+                    # Sized passes repeat until the step fits or the floor.
+                    released = await self._release_offload_slots_for_headroom(
+                        exclude_model_id, request_id, current + predicted - target
                     )
-                    if slots_freed:
+                    if released:
+                        slots_freed += released
                         continue
+                    slots_exhausted = True
 
                 if not hot_cache_attempted:
                     # Cached prefix blocks give way before any model does.
@@ -3564,9 +3579,10 @@ class EnginePool:
         return freed
 
     async def _release_offload_slots_for_headroom(
-        self, model_id: str, request_id: str
+        self, model_id: str, request_id: str, shortfall: int
     ) -> int:
-        """Release the model's MoE offload slots on its MLX thread; return the bytes."""
+        """Release ``shortfall`` bytes of the model's MoE offload slots, rounded up
+        to the next release step, on its MLX thread; return the bytes."""
         entry = self._entries.get(model_id)
         engine = entry.engine if entry is not None else None
         core = (
@@ -3581,7 +3597,9 @@ class EnginePool:
             return 0
         loop = asyncio.get_running_loop()
         try:
-            released = await loop.run_in_executor(executor, release, request_id)
+            released = await loop.run_in_executor(
+                executor, release, request_id, shortfall
+            )
         except Exception as e:
             logger.warning(
                 "MoE offload slot release failed for prefill request %s: %s",
@@ -4528,6 +4546,34 @@ class EnginePool:
                     except Exception as e:
                         logger.warning(
                             f"MiniMax DSpark drafter load raised for {model_id}: "
+                            f"{e} -- Lightning MTP stays off"
+                        )
+                    else:
+                        engine.set_dflash_drafter(drafter)
+
+            # Inkling 2 bundles its DSpark draft as mtp.safetensors.
+            if (
+                model_settings is not None
+                and getattr(model_settings, "mtp_enabled", False)
+                and entry.config_model_type == "inkling2"
+                and hasattr(engine, "prepare_dflash_target")
+            ):
+                draft_path = bundled_inkling2_dspark_path(entry.model_path)
+                fixed = getattr(model_settings, "mtp_fixed_depth", None)
+                depth = fixed or getattr(model_settings, "mtp_adaptive_max_depth", None)
+                if draft_path is not None:
+                    try:
+                        drafter = await asyncio.get_running_loop().run_in_executor(
+                            get_mlx_executor(),
+                            load_inkling2_dspark_drafter,
+                            entry.model_path,
+                            engine.prepare_dflash_target(),
+                            depth,
+                            bool(fixed),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Inkling 2 DSpark drafter load raised for {model_id}: "
                             f"{e} -- Lightning MTP stays off"
                         )
                     else:
